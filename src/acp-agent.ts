@@ -3245,6 +3245,7 @@ export class ClaudeAcpAgent {
       asyncState: "failed" | "stopped",
       context: string,
     ): Promise<void> => {
+      await compaction.interrupt();
       await Promise.all([
         subagents
           .finishAll(nativeState, sendUpdate)
@@ -3379,6 +3380,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      compaction.resume();
       ensureUsageMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
@@ -3743,6 +3745,9 @@ export class ClaudeAcpAgent {
       error: unknown,
       title?: string,
     ) => {
+      if (session.activeTurn && !session.activeTurn.settled) {
+        await compaction.interrupt();
+      }
       if (kind === "auth_required") {
         // One sign-out arrives twice — the synthetic login assistant message
         // and the turn's error-shaped result repeat the same text — and the
@@ -3886,6 +3891,7 @@ export class ClaudeAcpAgent {
               this.trackOrphanCommand(session, active.promptUuid, "started");
             }
           }
+          await compaction.interrupt();
           await settleActive(turnOutcome(session, "cancelled"));
           // The cancelled turn's result may never come (that's why the
           // backstop fired) — close its delivery stretch here so partial
@@ -4004,6 +4010,7 @@ export class ClaudeAcpAgent {
               const queued = findUnsettledTurn(frame.command_uuid);
               if (queued) {
                 queued.commandStarted = true;
+                compaction.resume();
               }
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".
@@ -4251,7 +4258,6 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    await compaction.reset();
                     await settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
@@ -4314,7 +4320,6 @@ export class ClaudeAcpAgent {
                     session.activeTurn &&
                     !session.activeTurn.settled
                   ) {
-                    await compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
                     // can legitimately precede the SDK picking up freshly
@@ -6125,6 +6130,10 @@ export class ClaudeAcpAgent {
       clearHookCallbacks(params.sessionId);
       return;
     }
+    // Echo-less commands such as /compact can still be in turnQueue while
+    // their compaction is running. Close it before ANY cancelled prompt
+    // resolves, not just the active-turn idle/backstop paths.
+    await session.contextCompaction?.interrupt();
     try {
       await session.nativeSubagentRuntime?.finishAll(
         "cancelled",
