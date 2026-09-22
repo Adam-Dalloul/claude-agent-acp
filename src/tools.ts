@@ -108,6 +108,10 @@ interface ToolUpdate {
       terminal_id: string;
       data: string;
     };
+    terminal_output_delta?: {
+      terminal_id: string;
+      data: string;
+    };
     terminal_exit?: {
       terminal_id: string;
       exit_code: number;
@@ -636,6 +640,7 @@ export function toolUpdateFromToolResult(
   toolUse: any | undefined,
   supportsTerminalOutput: boolean = false,
   toolUseResult?: unknown,
+  preferTerminalOutputDelta: boolean = false,
 ): ToolUpdate {
   if (
     "is_error" in toolResult &&
@@ -844,10 +849,19 @@ export function toolUpdateFromToolResult(
             terminal_info: {
               terminal_id: terminalId,
             },
-            terminal_output: {
-              terminal_id: terminalId,
-              data: output,
-            },
+            ...(preferTerminalOutputDelta
+              ? {
+                  terminal_output_delta: {
+                    terminal_id: terminalId,
+                    data: output,
+                  },
+                }
+              : {
+                  terminal_output: {
+                    terminal_id: terminalId,
+                    data: output,
+                  },
+                }),
             terminal_exit: {
               terminal_id: terminalId,
               exit_code: exitCode,
