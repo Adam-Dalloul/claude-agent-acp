@@ -4555,6 +4555,7 @@ export class ClaudeAcpAgent {
                     },
                     supportsNotices,
                     transcriptText,
+                    { claudeCode: { kind: "informational", level: message.level } },
                   ),
                 });
                 const noticedTurn = session.activeTurn ?? session.turnQueue?.[0];
