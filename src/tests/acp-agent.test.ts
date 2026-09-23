@@ -2312,7 +2312,7 @@ describe("usage Markdown", () => {
       .map((update) => (update.update as any).content.text)
       .join("");
     expect(forwardedPrompt).toBe("/usage");
-    expect(text).toBe(raw);
+    expect(text).toBe(`${raw}\n\n`);
   });
 
   it("cancels a turn while structured usage is pending without publishing fallback output", async () => {
@@ -4872,6 +4872,7 @@ describe("subagent permission attribution (issue #851)", () => {
   });
 
   it("closes local command output so the model's reply is a separate block", async () => {
+    const commandOutputUuid = randomUUID();
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -4886,7 +4887,7 @@ describe("subagent permission attribution (issue #851)", () => {
           type: "system",
           subtype: "local_command_output",
           content: "Goal set: ship the release",
-          uuid: randomUUID(),
+          uuid: commandOutputUuid,
           session_id: "test-session",
         },
         {
@@ -4916,6 +4917,11 @@ describe("subagent permission attribution (issue #851)", () => {
       .map(({ update }) => (update as { content: { text: string } }).content.text)
       .join("");
     expect(text).toBe("Goal set: ship the release\n\nI'll start on that now.");
+    const [commandChunk, replyChunk] = updates
+      .filter(({ update }) => update.sessionUpdate === "agent_message_chunk")
+      .map(({ update }) => update as { messageId?: string });
+    expect(commandChunk.messageId).toBe(commandOutputUuid);
+    expect(replyChunk.messageId).not.toBe(commandOutputUuid);
   });
 
   it("prunes the mapping when the task settles (task_notification)", async () => {
@@ -11845,7 +11851,7 @@ describe("assembled assistant text fallback", () => {
         claudeCode: { toolName: "compact" },
       },
     });
-    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
+    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic\n\n"]);
   });
 
   it("does not repeat a failed compaction error delivered as an assistant message", async () => {
@@ -12072,7 +12078,7 @@ describe("assembled assistant text fallback", () => {
         _meta: { contextCompaction: { version: 1, error: "summary rejected" } },
       },
     ]);
-    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
+    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic\n\n"]);
   });
 
   it("closes a compaction the turn abandoned as cancelled, before the prompt settles", async () => {

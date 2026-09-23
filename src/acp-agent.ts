@@ -4438,16 +4438,18 @@ export class ClaudeAcpAgent {
                 if (usageMarkdown === null) break;
                 // A command's output is a complete message, but the model's
                 // reply to the same turn streams in as further
-                // `agent_message_chunk`s, which by protocol concatenate onto
-                // this one. Close it with a blank line so the two render as
-                // separate blocks: without it `/goal ship the release` reads
-                // as "Goal set: ship the releaseI'll start on that now."
+                // `agent_message_chunk`s. Give it its own `messageId` (like the
+                // other local-command render paths) so clients can tell the two
+                // apart, and close it with a blank line for clients that ignore
+                // message ids: otherwise `/goal ship the release` reads as
+                // "Goal set: ship the releaseI'll start on that now."
                 const output = (usageMarkdown ?? message.content).replace(/\s+$/, "");
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text: output ? `${output}\n\n` : output },
+                    messageId: message.uuid,
                   },
                 });
                 break;
