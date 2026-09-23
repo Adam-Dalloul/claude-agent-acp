@@ -17,6 +17,7 @@ export function airSessionFailureCapabilityMeta(...additionalCapabilities: strin
 }
 
 export type ClaudeFailureKind =
+  | "access_denied"
   | "advisory"
   | "auth_required"
   | "bad_request"
@@ -48,6 +49,10 @@ export type PublishedSessionFailure = {
   severity: AirSessionFailureSeverity;
   title: string;
   details?: string;
+  /** A machine-readable refinement of `kind`, e.g. the `--hide-claude-auth`
+   *  subscription guard's reason on an `auth_required` failure. Absent for a
+   *  plain sign-out. */
+  reason?: string;
   actions: AirSessionFailureAction[];
   recoveryPolicy: SessionFailureRecoveryPolicy;
 };
@@ -58,6 +63,7 @@ type SessionFailureOptions = {
   title?: string;
   details?: string;
   severity?: AirSessionFailureSeverity;
+  reason?: string;
 };
 
 export type SessionFailureState = {
@@ -88,6 +94,15 @@ const AIR_FAILURE_POLICY: Record<
     fallbackTitle: string;
   }
 > = {
+  // Account or credential blocks that signing in again cannot fix: the
+  // organization must complete verification, or the cloud provider's
+  // credentials must be refreshed outside Claude. No `login` action, and not
+  // sticky like `auth_required` (nothing clears at `auth_status`).
+  access_denied: {
+    category: "access",
+    actions: ["retry"],
+    fallbackTitle: "Claude could not access the account or provider credentials.",
+  },
   advisory: {
     category: "unknown",
     actions: [],
@@ -158,6 +173,7 @@ export function sessionFailureMeta(failure: PublishedSessionFailure) {
     severity: failure.severity,
     title: failure.title,
     ...(failure.details ? { details: failure.details } : {}),
+    ...(failure.reason ? { reason: failure.reason } : {}),
     actions: failure.actions,
   });
 }
@@ -296,6 +312,29 @@ export class SessionFailureController {
     }
   }
 
+  /** Whether a session-scoped error of `kind` is active. A turn-scoped
+   *  warning of the same kind (an `api_retry` notice) does not count: it
+   *  reports a retry in progress, not the state the error would publish.
+   *
+   *  `reason` refines `kind`, so the active record must carry the same one,
+   *  and an omitted `reason` matches only a record with no reason. A plain
+   *  sign-out and the `--hide-claude-auth` subscription refusal are both
+   *  `auth_required`, but they tell the user different things. Neither may
+   *  suppress the other. */
+  hasActiveSessionError(kind: ClaudeFailureKind, reason?: string): boolean {
+    for (const failure of this.state.active.values()) {
+      if (
+        failure.kind === kind &&
+        failure.severity === "error" &&
+        failure.turnId === undefined &&
+        failure.reason === reason
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   recordActive(failure: PublishedSessionFailure): void {
     this.state.revisions.set(failure.id, failure.revision);
     this.state.active.set(failure.id, failure);
@@ -357,6 +396,7 @@ export class SessionFailureController {
       severity: failureOptions.severity ?? "error",
       title,
       ...(failureOptions.details ? { details: failureOptions.details } : {}),
+      ...(failureOptions.reason ? { reason: failureOptions.reason } : {}),
       actions: failureOptions.severity === "warning" ? [] : policy.actions,
       recoveryPolicy: sessionFailureRecoveryPolicy(
         kind,
@@ -418,6 +458,15 @@ export function providerFailureCategory(
     case "billing_error":
     case "account_on_hold":
       return "quota_exhausted";
+    // 403 `permission_error` with error_code `verification_required` (the
+    // organization must verify at the console), and a Bedrock/Vertex/Foundry
+    // credential the CLI could not load (transient: it retries, and asks the
+    // user to check or refresh the credentials). Both are access failures
+    // `/login` does not repair, so they get their own lane rather than
+    // `auth_required`'s login action and sticky auth_status recovery.
+    case "verification_required":
+    case "cloud_credential_error":
+      return "access_denied";
     case "rate_limit":
       return "rate_limited";
     case "overloaded":

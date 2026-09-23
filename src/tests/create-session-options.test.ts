@@ -5,14 +5,17 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { ALLOW_BYPASS } from "../permissions/modes.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let sessionMessages: Record<string, unknown>[];
+let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
@@ -31,6 +34,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
+        interrupt: async () => undefined,
+        close: () => {},
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -48,6 +53,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
     },
+    getSessionMessages: vi.fn(() => sessionMessagesResult()),
   };
 });
 
@@ -75,6 +81,9 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    sessionMessages = [];
+    sessionMessagesResult = async () => sessionMessages;
+    vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
     setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
@@ -88,6 +97,59 @@ describe("createSession options merging", () => {
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  for (const method of ["resumeSession", "loadSession"] as const) {
+    for (const limit of ["maxTurns", "maxBudgetUsd"] as const) {
+      it(`${method} applies added, tightened and removed ${limit} to the SDK query`, async () => {
+        const cwd = process.cwd();
+        const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+        for (const value of [10, 1, undefined]) {
+          const previousOptions = capturedOptions;
+          await agent[method]({
+            sessionId,
+            cwd,
+            mcpServers: [],
+            _meta: { claudeCode: { options: { [limit]: value } } },
+          });
+
+          expect(capturedOptions).not.toBe(previousOptions);
+          expect(capturedOptions?.[limit]).toBe(value);
+          expect(capturedOptions?.resume).toBe(sessionId);
+        }
+      });
+    }
+
+    it(`${method} reuses the SDK query when execution limits are unchanged`, async () => {
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxTurns: 10, maxBudgetUsd: 1 } } },
+      });
+      const previousOptions = capturedOptions;
+
+      await agent[method]({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxBudgetUsd: 1, maxTurns: 10 } } },
+      });
+
+      expect(capturedOptions).toBe(previousOptions);
+    });
+  }
+
+  describe("allowDangerouslySkipPermissions", () => {
+    it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(ALLOW_BYPASS);
+      expect(response.modes!.availableModes.some((mode) => mode.id === "bypassPermissions")).toBe(
+        ALLOW_BYPASS,
+      );
+    });
   });
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {
@@ -117,6 +179,21 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+  });
+
+  it("ignores the provider-specific main-thread agent option", async () => {
+    const response = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { agent: "reviewer" },
+        },
+      },
+    });
+
+    expect(capturedOptions).not.toHaveProperty("agent");
+    expect(response.configOptions?.some((option) => option.id === "agent")).toBe(false);
   });
 
   it("works when user provides empty disallowedTools", async () => {
@@ -284,6 +361,36 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.tools).toEqual([]);
+  });
+
+  it("recreates a resumed Query with changed skills and the same session ID", async () => {
+    const created = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf"] },
+        },
+      },
+    });
+    const initialQuery = agent.sessions[created.sessionId]!.query;
+    expect(capturedOptions!.skills).toEqual(["pdf"]);
+
+    await agent.resumeSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["docx"] },
+        },
+      },
+    });
+
+    expect(Object.keys(agent.sessions)).toEqual([created.sessionId]);
+    expect(agent.sessions[created.sessionId]!.query).not.toBe(initialQuery);
+    expect(capturedOptions!.resume).toBe(created.sessionId);
+    expect(capturedOptions!.skills).toEqual(["docx"]);
   });
 
   describe("subagent transcript forwarding", () => {
@@ -769,25 +876,106 @@ describe("createSession options merging", () => {
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("session/load seeds the window from the resumed session's getContextUsage report", async () => {
-      // Resumed sessions get getContextUsage serviced pre-turn (issue #845 uses
-      // it to restore the live model), and the same response carries the
-      // authoritative window (`rawMaxTokens`). After a process restart the
-      // module cache is empty and text inference misses natively-1M aliases, so
-      // discarding this in-hand value would replay the issue-#596 flicker on
-      // every reload — the flagship scenario. 888_000 can only come from the
-      // report: inference on the mock model yields null → 200_000 default.
-      contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
+    it("session/load restores the transcript model without waiting for getContextUsage", async () => {
+      // getContextUsage is a live CLI control request. On a real, large resumed
+      // session it can take tens of seconds before returning, so it must stay
+      // off the load critical path. Claude restores from this same last
+      // assistant model field, which is available through a local transcript
+      // read in milliseconds.
+      const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
+      contextUsageResult = ctxSpy;
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "resumed-model-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
 
-      await (
-        agent as unknown as {
-          createSession: (params: object, opts: { resume?: string }) => Promise<unknown>;
-        }
-      ).createSession({ cwd: process.cwd(), mcpServers: [] }, { resume: "resumed-window-probe" });
+      const response = await agent.loadSession({
+        sessionId: "resumed-model-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
 
-      const session = sessionFor("resumed-window-probe");
-      expect(session.contextWindowSize).toBe(888_000);
-      expect(session.contextWindowAuthoritative).toBe(true);
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
+      expect(getSessionMessages).toHaveBeenCalledTimes(1);
+      expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
+    });
+
+    it("resume remains best-effort when the transcript hint cannot be read", async () => {
+      sessionMessagesResult = async () => {
+        throw new Error("unreadable transcript");
+      };
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "unreadable-resume-probe",
+          cwd: process.cwd(),
+          mcpServers: [],
+        }),
+      ).resolves.toMatchObject({ sessionId: "unreadable-resume-probe" });
+    });
+
+    it("restores the transcript model for direct session/new resume metadata", async () => {
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "direct-resume-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
+
+      const response = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { resume: "direct-resume-probe" } } },
+      });
+
+      expect(response.sessionId).toBe("direct-resume-probe");
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(getSessionMessages).toHaveBeenCalledOnce();
+      expect(getSessionMessages).toHaveBeenCalledWith("direct-resume-probe");
     });
 
     it("scopes providerCacheKey by per-session env routing", async () => {
@@ -991,9 +1179,22 @@ describe("createSession options merging", () => {
     ];
 
     let originalAnthropicModel: string | undefined;
+    let originalClaudeConfigDir: string | undefined;
+    let configDir: string;
     beforeEach(() => {
       originalAnthropicModel = process.env.ANTHROPIC_MODEL;
       delete process.env.ANTHROPIC_MODEL;
+      // These tests assert which model a fresh session lands on with no
+      // override in play, so both override tiers above the SDK's default have
+      // to be neutralized: ANTHROPIC_MODEL and `model` from the user
+      // settings tier. Without the second one, a developer whose own
+      // ~/.claude/settings.json pins a model (e.g. "opus[1m]") sees the
+      // session start on that model instead of models[0]. resolveSettings
+      // reads the user tier from CLAUDE_CONFIG_DIR at call time, so pointing
+      // it at an empty directory is enough.
+      originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-model-config-"));
+      process.env.CLAUDE_CONFIG_DIR = configDir;
     });
     afterEach(() => {
       if (originalAnthropicModel !== undefined) {
@@ -1001,6 +1202,12 @@ describe("createSession options merging", () => {
       } else {
         delete process.env.ANTHROPIC_MODEL;
       }
+      if (originalClaudeConfigDir !== undefined) {
+        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
+      } else {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      }
+      fs.rmSync(configDir, { recursive: true, force: true });
     });
 
     it("tolerates a PreModelSwitch hook vetoing the fresh-session model pin", async () => {
@@ -1034,6 +1241,49 @@ describe("createSession options merging", () => {
 
       await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toThrow(
         "transport exploded",
+      );
+    });
+
+    it("routes the PostCompact hook's summary into the session's compaction lifecycle", async () => {
+      // The retained summary only reaches the SDK stream framed as the
+      // model-facing continuation prompt; the hook is the adapter's source for
+      // the ACP compaction_update summary.
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const sessionId = response.sessionId;
+
+      const matchers = capturedOptions!.hooks?.PostCompact;
+      expect(matchers).toBeDefined();
+      const callback = (matchers!.at(-1) as any).hooks[0];
+      // The lifecycle belongs to the stream consumer, which the first prompt
+      // starts; a compaction can only ever fire while it is running.
+      (agent as any).ensureConsumer((agent as any).sessions[sessionId], sessionId);
+      const lifecycle = (agent as any).sessions[sessionId].contextCompaction;
+      expect(lifecycle).toBeDefined();
+      const recordSummary = vi.spyOn(lifecycle, "recordSummary");
+
+      const base = {
+        hook_event_name: "PostCompact",
+        session_id: sessionId,
+        transcript_path: "",
+        cwd: process.cwd(),
+        trigger: "manual",
+      };
+      // A subagent's compaction is not the root session's entity.
+      await callback(
+        { ...base, agent_id: "agent-1", compact_summary: "<summary>child</summary>" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+      expect(recordSummary).not.toHaveBeenCalled();
+
+      const out = await callback(
+        { ...base, compact_summary: "<analysis>x</analysis><summary>Retained.</summary>" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+      expect(out).toEqual({ continue: true });
+      expect(recordSummary).toHaveBeenCalledWith(
+        "<analysis>x</analysis><summary>Retained.</summary>",
       );
     });
 
